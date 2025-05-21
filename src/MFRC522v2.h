@@ -102,6 +102,8 @@ const byte FM17522E_firmware_reference[]
 
 class MFRC522 {
 public:
+  friend class MFRC522TCL;
+
   //using PCD_Register = MFRC522Constants::PCD_Register;
   using PCD_Register = MFRC522Constants::PCD_Register;
   using PCD_RxGain = MFRC522Constants::PCD_RxGain;
