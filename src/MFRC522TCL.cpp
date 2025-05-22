@@ -1,5 +1,105 @@
 #include "MFRC522TCL.h"
 
+/**
+ * Executes the Transceive command.
+ * CRC validation can only be done if backData and backLen are specified.
+ * 
+ * @return StatusCode::STATUS_OK on success, StatusCode::STATUS_??? otherwise.
+ */
+MFRC522::StatusCode MFRC522TCL::PCD_TransceiveDataEx(byte *sendData,        ///< Pointer to the data to transfer to the FIFO.
+                                                    byte sendLen,           ///< Number of bytes to transfer to the FIFO.
+                                                    byte *backData,         ///< nullptr or pointer to buffer if data should be read back after executing the command.
+                                                    byte *backLen,          ///< In: Max number of bytes to write to *backData. Out: The number of bytes returned.
+                                                    byte *validBits,        ///< In/Out: The number of valid bits in the last byte. 0 for 8 valid bits. Default nullptr.
+                                                    byte rxAlign,           ///< In: Defines the bit position in backData[0] for the first bit received. Default 0.
+                                                    bool checkCRC,          ///< In: True => The last two bytes of the response is assumed to be a CRC_A that must be validated.
+                                                    bool waitForData,       ///< In: True => Wait for data in FIFO buffer. Zero length responses will timeout.
+                                                    unsigned long timeoutMs ///< In: Timeout in milliseconds.
+                                                    ) {
+  // Prepare values for BitFramingReg
+  byte txLastBits = validBits ? *validBits : 0;
+  byte bitFraming = (rxAlign << 4)+txLastBits;    // RxAlign = BitFramingReg[6..4]. TxLastBits = BitFramingReg[2..0]
+
+  _driver.PCD_WriteRegister(PCD_Register::CommandReg, PCD_Command::PCD_Idle);      // Stop any active command.
+  _driver.PCD_WriteRegister(PCD_Register::ComIrqReg, 0x7F);          // Clear all seven interrupt request bits
+  _driver.PCD_WriteRegister(PCD_Register::FIFOLevelReg, 0x80);        // FlushBuffer = 1, FIFO initialization
+  _driver.PCD_WriteRegister(PCD_Register::FIFODataReg, sendLen, sendData);  // Write sendData to the FIFO
+  _driver.PCD_WriteRegister(PCD_Register::BitFramingReg, bitFraming);    // Bit adjustments
+  _driver.PCD_WriteRegister(PCD_Register::CommandReg, PCD_Command::PCD_Transceive); // Execute the command
+  _device.PCD_SetRegisterBitMask(PCD_Register::BitFramingReg, 0x80);  // StartSend=1, transmission of data starts
+  
+  // Wait for the command to complete.
+  // In PCD_Init() we set the TAuto flag in TModeReg. This means the timer automatically starts when the PCD stops transmitting.
+  const auto deadline = millis() + timeoutMs;
+  bool completed = false;
+  
+  do {
+    byte n = _driver.PCD_ReadRegister(PCD_Register::ComIrqReg);  // ComIrqReg[7..0] bits are: Set1 TxIRq RxIRq IdleIRq HiAlertIRq LoAlertIRq ErrIRq TimerIRq
+    
+    // RxIRq set and FIFO has data or don't wait for data
+    if(n & 0x20 && (!waitForData || _driver.PCD_ReadRegister(PCD_Register::FIFOLevelReg) > 0)) {
+      completed = true;
+      break;
+    }
+    yield();
+  }
+  while (millis() < deadline);
+  
+  if(!completed) {
+    return StatusCode::STATUS_TIMEOUT;
+  }
+  
+  // Stop now if any errors except collisions were detected.
+  byte errorRegValue = _driver.PCD_ReadRegister(PCD_Register::ErrorReg); // ErrorReg[7..0] bits are: WrErr TempErr reserved BufferOvfl CollErr CRCErr ParityErr ProtocolErr
+  if(errorRegValue & 0x13) {   // BufferOvfl ParityErr ProtocolErr
+    return StatusCode::STATUS_ERROR;
+  }
+  
+  byte _validBits = 0;
+  
+  // If the caller wants data back, get it from the MFRC522.
+  if(backData && backLen) {
+    byte n = _driver.PCD_ReadRegister(PCD_Register::FIFOLevelReg);  // Number of bytes in the FIFO
+    if(n > *backLen) {
+      return StatusCode::STATUS_NO_ROOM;
+    }
+    *backLen = n;                      // Number of bytes returned
+    _driver.PCD_ReadRegister(PCD_Register::FIFODataReg, n, backData, rxAlign);  // Get received data from FIFO
+    _validBits = _driver.PCD_ReadRegister(PCD_Register::ControlReg) & 0x07;    // RxLastBits[2:0] indicates the number of valid bits in the last received byte. If this value is 000b, the whole byte is valid.
+    if(validBits) {
+      *validBits = _validBits;
+    }
+  }
+  
+  // Tell about collisions
+  if(errorRegValue & 0x08) {    // CollErr
+    return StatusCode::STATUS_COLLISION;
+  }
+  
+  // Perform CRC_A validation if requested.
+  if(backData && backLen && checkCRC) {
+    // In this case a MIFARE Classic NAK is not OK.
+    if(*backLen == 1 && _validBits == 4) {
+      return StatusCode::STATUS_MIFARE_NACK;
+    }
+    // We need at least the CRC_A value and all 8 bits of the last byte must be received.
+    if(*backLen < 2 || _validBits != 0) {
+      return StatusCode::STATUS_CRC_WRONG;
+    }
+    // Verify CRC_A - do our own calculation and store the control in controlBuffer.
+    byte                controlBuffer[2];
+    MFRC522::StatusCode status = _device.PCD_CalculateCRC(&backData[0], *backLen-2, &controlBuffer[0]);
+    if(status != StatusCode::STATUS_OK) {
+      return status;
+    }
+    if((backData[*backLen-2] != controlBuffer[0]) || (backData[*backLen-1] != controlBuffer[1])) {
+      return StatusCode::STATUS_CRC_WRONG;
+    }
+  }
+  
+  return StatusCode::STATUS_OK;
+}
+
 bool MFRC522TCL::PICC_IsTCLPresent()
 {
   // IF SAK bit 6 = 1 then it is ISO/IEC 14443-4 (T=CL)
@@ -149,7 +249,7 @@ MFRC522::StatusCode MFRC522TCL::PICC_RequestATS(Ats *ats)
   }
 
   // Transmit the buffer and receive the response, validate CRC_A.
-  result = _device.PCD_TransceiveData(bufferATS, 4, bufferATS, &bufferSize, NULL, 0, true);
+  result = PCD_TransceiveDataEx(bufferATS, 4, bufferATS, &bufferSize, NULL, 0, true);
   if (result != StatusCode::STATUS_OK)
   {
     _device.PICC_HaltA();
@@ -337,7 +437,7 @@ MFRC522::StatusCode MFRC522TCL::PICC_PPS(TagBitRates sendBitRate,   ///< DS
   }
 
   // Transmit the buffer and receive the response, validate CRC_A.
-  result = _device.PCD_TransceiveData(ppsBuffer, 5, ppsBuffer, &ppsBufferSize, NULL, 0, true);
+  result = PCD_TransceiveDataEx(ppsBuffer, 5, ppsBuffer, &ppsBufferSize, NULL, 0, true);
   if (result == StatusCode::STATUS_OK)
   {
     // Make sure it is an answer to our PPS
@@ -450,7 +550,7 @@ MFRC522::StatusCode MFRC522TCL::TCL_Transceive(PcbBlock *send, PcbBlock *back)
   }
 
   // Transceive the block
-  result = _device.PCD_TransceiveData(outBuffer, outBufferOffset, inBuffer, &inBufferSize);
+  result = PCD_TransceiveDataEx(outBuffer, outBufferOffset, inBuffer, &inBufferSize);
   if (result != StatusCode::STATUS_OK)
   {
     return result;
@@ -710,7 +810,7 @@ MFRC522::StatusCode MFRC522TCL::TCL_Deselect()
     outBufferSize = 2;
   }
 
-  result = _device.PCD_TransceiveData(outBuffer, outBufferSize, inBuffer, &inBufferSize);
+  result = PCD_TransceiveDataEx(outBuffer, outBufferSize, inBuffer, &inBufferSize);
   if (result != StatusCode::STATUS_OK)
   {
     return result;

@@ -12,6 +12,7 @@ private:
   using StatusCode = MFRC522Constants::StatusCode;
   using PICC_Command = MFRC522Constants::PICC_Command;
   using PCD_Register = MFRC522Constants::PCD_Register;
+  using PCD_Command = MFRC522Constants::PCD_Command;
 
   MFRC522 &_device;
   MFRC522Driver &_driver;
@@ -96,6 +97,13 @@ public:
   StatusCode TCL_Deselect();
 
 private:
+  StatusCode PCD_TransceiveDataEx(byte *sendData, byte sendLen,
+                                  byte *backData, byte *backLen,
+                                  byte *validBits = nullptr, byte rxAlign = 0,
+                                  bool checkCRC = false,
+                                  bool waitForData = true,
+                                  unsigned long timeoutMs = 500);
+
   Ats ats = {0};
   bool blockToggle = false;
 };
